@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Local reports and temporary files
+report/
+.ehscanner_tmp_*
+
+# Editors / operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
