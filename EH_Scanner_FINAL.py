@@ -6,12 +6,50 @@ import os
 import re
 import sys
 import time
+import shlex
 import shutil
 import json
 import urllib.request
 import urllib.parse
 import urllib.error
 from datetime import datetime
+import builtins
+
+
+class ExitRequested(BaseException):
+    """Raised only after the user confirms exiting the entire application."""
+
+
+_original_input = builtins.input
+
+def _confirm_exit():
+    """Ask once; a negative answer lets the caller continue its current flow."""
+    while True:
+        try:
+            answer = _original_input("\nExit EH Scanner completely? (y/n): ").strip().lower()
+        except KeyboardInterrupt:
+            print("\nPlease answer y or n.")
+            continue
+        if answer in ("y", "yes"):
+            raise ExitRequested()
+        if answer in ("n", "no", ""):
+            print("Continuing from the current menu/input.")
+            return False
+        print("Please enter y or n.")
+
+def input(prompt=""):
+    """Centralized input: Ctrl+C asks before exiting; menu 0/exit confirms exit."""
+    while True:
+        try:
+            value = _original_input(prompt)
+        except KeyboardInterrupt:
+            _confirm_exit()
+            continue
+        # Only treat 0/exit as the global exit command at numbered menu prompts.
+        if "select option" in str(prompt).lower() and value.strip().lower() in ("0", "exit"):
+            _confirm_exit()
+            continue
+        return value
 
 # ============================================================
 # TERMINAL COLOR THEME
@@ -110,7 +148,7 @@ report_data = {
     "configuration": None,
     "script_result": "",
     "metasploit_status": "",
-    "metasploit_session": {"capture_status": "Not run", "start_time": None, "end_time": None, "output": ""},
+    "metasploit_session": {"capture_status": "Not run", "start_time": None, "end_time": None, "output": "", "exit_code": None},
     "netcat_session": {"mode": None, "endpoint": None, "command": None, "start_time": None, "end_time": None, "status": "Not run", "exit_code": None, "capture_status": "Not run", "transcript": ""},
     "script_recommendation": None,
     "script_command": None,
@@ -262,7 +300,9 @@ def run_with_animation(command):
                 pass
 
     if interrupted:
-        print("[ ! ] Operation stopped by user. Returning to EH Scanner.")
+        print("[ ! ] Operation stopped by user.")
+        _confirm_exit()
+        print("Returning to the current EH Scanner workflow.")
         marker = "Stopped by user (Ctrl+C)."
         stderr = ((stderr or "").rstrip() + "\n" + marker).strip()
         return stdout or "", stderr, 130
@@ -368,28 +408,51 @@ def show_lines(data):
 # TARGET SELECTION
 # ============================================================
 
+def nmap_address_family_args(target):
+    """Return Nmap's IPv6 switch when the selected target is an IPv6 address."""
+    try:
+        address = ipaddress.ip_address(str(target).split("%", 1)[0])
+    except ValueError:
+        return []
+    return ["-6"] if address.version == 6 else []
+
+
 def select_target():
     print("\n========= Target Selection =========")
-    print("Enter an IP address or domain name.")
+    print("Enter an IPv4/IPv6 address or domain name.")
     entered_target = input("Target IP/Domain: ").strip()
 
     if not entered_target:
         print("Target cannot be empty.")
         return None
 
-    # Accept literal IPs; otherwise resolve the domain to an IPv4 address.
+    # Keep IPv4 preference for dual-stack domains to preserve existing behavior;
+    # fall back to IPv6 when the domain has no IPv4 address.
     try:
         resolved_target = str(ipaddress.ip_address(entered_target))
     except ValueError:
         try:
-            resolved_target = socket.gethostbyname(entered_target)
-        except (socket.gaierror, UnicodeError):
-            print_error("Could not resolve that domain to an IP address.")
+            answers = socket.getaddrinfo(entered_target, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+            addresses = []
+            for answer in answers:
+                candidate = answer[4][0]
+                if candidate not in addresses:
+                    addresses.append(candidate)
+            resolved_target = next(
+                (addr for addr in addresses if ipaddress.ip_address(addr.split("%", 1)[0]).version == 4),
+                next((addr for addr in addresses if ipaddress.ip_address(addr.split("%", 1)[0]).version == 6), None)
+            )
+            if not resolved_target:
+                raise socket.gaierror("No IPv4 or IPv6 address records found")
+        except (socket.gaierror, UnicodeError, ValueError, IndexError):
+            print_error("Could not resolve that domain to an IPv4 or IPv6 address.")
             return None
 
     print("\nSelected Target:")
     print(f"Input   : {entered_target}")
     print(f"Resolved: {resolved_target}")
+    if nmap_address_family_args(resolved_target):
+        print("Address family: IPv6 (Nmap will use -6 for supported scans)")
 
     reset_report(resolved_target)
     report_data["target_input"] = entered_target
@@ -412,6 +475,7 @@ def scan_menu(target):
         print(f"{C_RED}3. Aggressive Scan{C_RESET}")
         print(f"{C_MAGENTA}4. Manual Nmap Scan{C_RESET}")
         print(f"{C_WHITE}5. Back{C_RESET}")
+        print(f"{C_RED}0. Exit EH Scanner{C_RESET}")
 
         if scan_completed:
             print(f"{C_CYAN}6. Next Page{C_RESET}")
@@ -424,15 +488,15 @@ def scan_menu(target):
             continue
 
         if option == 1:
-            command = ["nmap", "-p-", "-sV", "-O", target]
+            command = ["nmap"] + nmap_address_family_args(target) + ["-p-", "-sV", "-O", target]
             report_data["scan_type"] = "TCP Version OS Scan"
 
         elif option == 2:
-            command = ["nmap", "-p-", "-sS", "-sV", "-O", target]
+            command = ["nmap"] + nmap_address_family_args(target) + ["-p-", "-sS", "-sV", "-O", target]
             report_data["scan_type"] = "SYN Version OS Scan"
 
         elif option == 3:
-            command = ["nmap", "-p-", "-A", "-sV", "-O", target]
+            command = ["nmap"] + nmap_address_family_args(target) + ["-p-", "-A", "-sV", "-O", target]
             report_data["scan_type"] = "Aggressive Scan"
 
         elif option == 4:
@@ -460,7 +524,7 @@ def scan_menu(target):
                 continue
             # No scan flags are forced here: the user supplies all Nmap arguments.
             # Nmap itself and the currently selected target are added by the app.
-            command = ["nmap"] + parsed_args + [target]
+            command = ["nmap"] + (nmap_address_family_args(target) if "-6" not in parsed_args else []) + parsed_args + [target]
             report_data["scan_type"] = "Manual Nmap Scan"
 
         elif option == 5:
@@ -681,6 +745,7 @@ def api_key_settings_menu():
         print("2. Verify VulnCheck API key")
         print("3. Remove VulnCheck API key")
         print("4. Back")
+        print("0. Exit EH Scanner")
         print("Current status:", "Configured (hidden)" if configured else "Not configured")
         choice = input("Select option: ").strip()
         if choice == "1":
@@ -1105,6 +1170,7 @@ def show_exploits(target, exploitdb, metasploit, port_info):
     else:
         print("1. Continue Without Selecting Exploit")
         print("2. Back")
+    print("0. Exit EH Scanner")
     try:
         menu_choice = int(input("Select option: "))
     except ValueError:
@@ -1434,6 +1500,7 @@ def build_auto_script_command(config):
     """
     return [
         "nmap",
+        *nmap_address_family_args(config["target"]),
         "-p", str(config["port"]),
         "-sC",
         config["target"]
@@ -1452,6 +1519,7 @@ def build_manual_script_command(config):
 
     return [
         "nmap",
+        *nmap_address_family_args(config["target"]),
         "-p", str(config["port"]),
         "--script", script_name,
         config["target"]
@@ -1572,6 +1640,7 @@ def manual_script(config):
         print("\n1. Run Recommended Script")
         print("2. Enter Another NSE Script")
         print("3. Back")
+        print("0. Exit EH Scanner")
 
         try:
             choice = int(input("\nSelect option: "))
@@ -1599,6 +1668,7 @@ def manual_script(config):
 
             command = [
                 "nmap",
+                *nmap_address_family_args(config["target"]),
                 "-p", str(config["port"]),
                 "--script", script,
                 config["target"]
@@ -1627,6 +1697,7 @@ def manual_script(config):
 
         command = [
             "nmap",
+            *nmap_address_family_args(config["target"]),
             "-p", str(config["port"]),
             "--script", script,
             config["target"]
@@ -1917,6 +1988,7 @@ def report_menu():
         print("2. HTML")
         print("3. All")
         print("4. Back")
+        print("0. Exit EH Scanner")
 
         try:
             choice = int(input("\nSelect option: "))
@@ -2028,6 +2100,7 @@ def netcat_menu(config):
                     process.kill(); return_code = process.wait()
             else:
                 return_code = process.returncode
+            _confirm_exit()
     except KeyboardInterrupt:
         status = "Stopped by user (Ctrl+C)"
         print("\nNetcat interrupted; returning to EH Scanner.")
@@ -2036,6 +2109,7 @@ def netcat_menu(config):
             try: return_code = process.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 process.kill(); return_code = process.wait()
+        _confirm_exit()
     except OSError as exc:
         status = f"Could not start: {exc}"
         session["capture_status"] = f"Unavailable: {exc}"
@@ -2059,11 +2133,11 @@ def netcat_menu(config):
         elif transcript_path:
             session["capture_status"] = "Unavailable: transcript file was not created; output was not captured."
         report_entry = (
-            "\\nNetcat Connection Builder:\\n"
-            f"Mode: {mode}\\nEndpoint: {endpoint}\\nCommand: {command_to_text(command)}\\n"
-            f"Start time: {session['start_time']}\\nEnd time: {session['end_time']}\\n"
-            f"Status: {status}\\nExit Code: {return_code if return_code is not None else 'N/A'}\\n"
-            f"Capture status: {session['capture_status']}\\n"
+            "\nNetcat Connection Builder:\n"
+            f"Mode: {mode}\nEndpoint: {endpoint}\nCommand: {command_to_text(command)}\n"
+            f"Start time: {session['start_time']}\nEnd time: {session['end_time']}\n"
+            f"Status: {status}\nExit Code: {return_code if return_code is not None else 'N/A'}\n"
+            f"Capture status: {session['capture_status']}\n"
         )
         report_data["script_result"] = str(report_data.get("script_result") or "") + report_entry
         try: save_default_txt_report()
@@ -2089,6 +2163,7 @@ def show_config(config, exploits, target, port_info):
         print(f"{C_CYAN}4. Report{C_RESET}")
         print(f"{C_MAGENTA}5. Netcat{C_RESET}")
         print(f"{C_WHITE}6. Back{C_RESET}")
+        print(f"{C_RED}0. Exit EH Scanner{C_RESET}")
 
         try:
             choice = int(input("\nSelect option: "))
@@ -2244,6 +2319,7 @@ def main():
 2. Select Target
 3. API Key Settings
 4. Exit
+0. Exit EH Scanner (with confirmation)
 """)
 
         try:
@@ -2349,4 +2425,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except ExitRequested:
+        try:
+            save_default_txt_report()
+        except Exception as report_error:
+            print_warning(f"Final report could not be saved: {report_error}")
+        print("\nEH Scanner exited cleanly. Goodbye.")
