@@ -27,10 +27,6 @@ Clone the repository and enter its directory:
 git clone https://github.com/EHAcdemy779/EH_Scanner.git
 cd EH_Scanner
 ```
-Run the IPv4 scanner:
-```bash
-python3 EH_Scanner_FINAL.py
-```
 Run the IPv6 scanner:
 ```bash
 python3 EH_Scanner_FINAL_IPv6.py
@@ -49,10 +45,6 @@ Optional terminal colours:
 ```powershell
 py -m pip install colorama
 ```
-Run the IPv4 scanner:
-```powershell
-py -3 EH_Scanner_FINAL.py
-```
 Run the IPv6 scanner:
 ```powershell
 py -3 EH_Scanner_FINAL_IPv6.py
@@ -69,10 +61,6 @@ Clone the repository and enter its directory:
 ```bash
 git clone https://github.com/EHAcdemy779/EH_Scanner.git
 cd EH_Scanner
-```
-Run the IPv4 scanner:
-```bash
-python EH_Scanner_FINAL.py
 ```
 Run the IPv6 scanner:
 ```bash
