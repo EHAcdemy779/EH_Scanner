@@ -24,8 +24,8 @@ sudo apt install -y netcat-openbsd netdiscover exploitdb
 Metasploit is optional; install it separately if required and available in your Kali package sources.
 Clone the repository and enter its directory:
 ```bash
-git clone <YOUR_GITHUB_REPOSITORY_URL>
-cd <REPOSITORY_FOLDER>
+git clone https://github.com/EHAcdemy779/EH_Scanner.git
+cd EH_Scanner
 ```
 Run the IPv4 scanner:
 ```bash
