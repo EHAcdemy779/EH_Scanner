@@ -6,13 +6,68 @@ import os
 import re
 import sys
 import time
-import shlex
 import shutil
+import shlex
 import json
 import urllib.request
 import urllib.parse
 import urllib.error
 from datetime import datetime
+import builtins
+
+
+class ExitRequested(BaseException):
+    """Raised only after the user confirms exiting the entire application."""
+
+
+class GUIStopRequested(BaseException):
+    """Internal signal: the Web GUI user cancelled the active scanner task."""
+
+
+def _register_gui_process(process):
+    """Expose a live child process to the local Web GUI Stop button, when present."""
+    processes = globals().get("GUI_ACTIVE_PROCESSES")
+    if processes is not None:
+        processes.add(process)
+
+
+def _unregister_gui_process(process):
+    """Remove a completed child process from the Web GUI's active-process set."""
+    processes = globals().get("GUI_ACTIVE_PROCESSES")
+    if processes is not None:
+        processes.discard(process)
+
+
+_original_input = builtins.input
+
+def _confirm_exit():
+    """Ask once; a negative answer lets the caller continue its current flow."""
+    while True:
+        try:
+            answer = _original_input("\nExit EH Scanner completely? (y/n): ").strip().lower()
+        except KeyboardInterrupt:
+            print("\nPlease answer y or n.")
+            continue
+        if answer in ("y", "yes"):
+            raise ExitRequested()
+        if answer in ("n", "no", ""):
+            print("Continuing from the current menu/input.")
+            return False
+        print("Please enter y or n.")
+
+def input(prompt=""):
+    """Centralized input: Ctrl+C asks before exiting; menu 0/exit confirms exit."""
+    while True:
+        try:
+            value = _original_input(prompt)
+        except KeyboardInterrupt:
+            _confirm_exit()
+            continue
+        # Only treat 0/exit as the global exit command at numbered menu prompts.
+        if "select option" in str(prompt).lower() and value.strip().lower() in ("0", "exit"):
+            _confirm_exit()
+            continue
+        return value
 
 # ============================================================
 # TERMINAL COLOR THEME
@@ -35,6 +90,11 @@ if COLOR_ENABLED:
     C_WHITE = Fore.WHITE
     C_BRIGHT = Style.BRIGHT
     C_RESET = Style.RESET_ALL
+elif os.environ.get("EH_SCANNER_WEB_GUI") == "1" or getattr(sys.stdout, "isatty", lambda: False)():
+    # Standard ANSI fallback: keeps colors available without the optional colorama package.
+    C_RED, C_GREEN, C_YELLOW = "\x1b[31m", "\x1b[32m", "\x1b[33m"
+    C_BLUE, C_CYAN, C_MAGENTA, C_WHITE = "\x1b[34m", "\x1b[36m", "\x1b[35m", "\x1b[37m"
+    C_BRIGHT, C_RESET = "\x1b[1m", "\x1b[0m"
 else:
     C_RED = C_GREEN = C_YELLOW = C_BLUE = ""
     C_CYAN = C_MAGENTA = C_WHITE = C_BRIGHT = C_RESET = ""
@@ -59,6 +119,13 @@ def print_warning(text):
 
 def print_error(text):
     print(f"{C_RED}{text}{C_RESET}")
+
+
+def print_option(text, color=None):
+    """Render menu options with clear visual hierarchy."""
+    if color is None:
+        color = C_WHITE
+    print(f"  {color}{C_BRIGHT}▶  {text}{C_RESET}")
 
 
 # ============================================================
@@ -165,8 +232,9 @@ def check_dependencies():
     print_title("========== Dependency Check ==========")
 
     required = ["nmap"]
-    discovery_tool = "FOUND" if command_exists("netdiscover") else "NOT FOUND"
-    print(f"{'netdiscover':<12}: {discovery_tool} (used for Network Discovery)")
+    discovery_tools = [name for name in ("nmap", "netdiscover") if command_exists(name)]
+    print(f"{'discovery':<12}: {', '.join(discovery_tools) if discovery_tools else 'No discovery tool found'}")
+    print("              Network Discovery prefers Nmap; Netdiscover is a Linux/Unix fallback.")
 
     for command in required:
         status = "FOUND" if command_exists(command) else "NOT FOUND"
@@ -221,20 +289,38 @@ def run_with_animation(command):
         print_error(f"\nUnable to start command: {error}")
         return "", str(error), 1
 
+    _register_gui_process(process)
     animation = ["|", "/", "-", "\\"]
     index = 0
     interrupted = False
     stdout = ""
     stderr = ""
-    print("Press Ctrl+C to stop this operation and return to EH Scanner.")
+    print("Press Ctrl+C (CLI) or use Stop task (Web GUI) to stop this operation.")
     try:
         while True:
             try:
+                # The Web GUI injects this event into the scanner module. CLI mode
+                # has no event and retains its normal Ctrl+C behavior.
+                stop_event = globals().get("GUI_STOP_EVENT")
+                if stop_event is not None and stop_event.is_set():
+                    interrupted = True
+                    break
                 stdout, stderr = process.communicate(timeout=0.2)
                 break
             except subprocess.TimeoutExpired:
-                print(f"\r[ {animation[index]} ] Working... Press Ctrl+C to stop.", end="", flush=True)
+                stop_event = globals().get("GUI_STOP_EVENT")
+                if stop_event is not None and stop_event.is_set():
+                    interrupted = True
+                    break
+                print(f"\r[ {animation[index]} ] Working... Stop task to cancel.", end="", flush=True)
                 index = (index + 1) % len(animation)
+        if interrupted and process.poll() is None:
+            try:
+                process.terminate()
+                stdout, stderr = process.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                stdout, stderr = process.communicate()
     except KeyboardInterrupt:
         interrupted = True
         print("\n\nStop requested. Stopping the running process...")
@@ -263,11 +349,18 @@ def run_with_animation(command):
                 pass
 
     if interrupted:
-        print("[ ! ] Operation stopped by user. Returning to EH Scanner.")
-        marker = "Stopped by user (Ctrl+C)."
+        print("[ ! ] Operation stopped by user.")
+        stop_event = globals().get("GUI_STOP_EVENT")
+        _unregister_gui_process(process)
+        if stop_event is not None and stop_event.is_set():
+            print("Returning to the EH Scanner main menu (Web GUI cancellation).")
+            raise GUIStopRequested()
+        _confirm_exit()
+        marker = "Stopped by user (GUI Stop/Ctrl+C)."
         stderr = ((stderr or "").rstrip() + "\n" + marker).strip()
         return stdout or "", stderr, 130
 
+    _unregister_gui_process(process)
     if process.returncode == 0:
         print("\r[ ✓ ] Operation completed.                    ")
     else:
@@ -280,9 +373,15 @@ def run_with_animation(command):
 # ============================================================
 
 def save_file(filename, data):
-    """Write UTF-8 text atomically to reduce the risk of partial report files."""
+    """Atomically save a report with read permissions for non-root users too.
+
+    NamedTemporaryFile normally creates mode-0600 files. Because os.replace()
+    preserves that mode, reports written as root could otherwise be unreadable
+    by a regular user. Reports may contain sensitive scan/session details, so
+    review and redact them before sharing on a multi-user machine.
+    """
     directory = os.path.dirname(os.path.abspath(filename))
-    os.makedirs(directory, exist_ok=True)
+    os.makedirs(directory, mode=0o755, exist_ok=True)
     temp_name = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -293,7 +392,17 @@ def save_file(filename, data):
             file.write(data)
             file.flush()
             os.fsync(file.fileno())
+        # Ensure the final report is readable regardless of whether root or a
+        # regular account created it. Best-effort for platforms without chmod.
+        try:
+            os.chmod(temp_name, 0o644)
+        except OSError:
+            pass
         os.replace(temp_name, filename)
+        try:
+            os.chmod(filename, 0o644)
+        except OSError:
+            pass
     except Exception:
         if temp_name and os.path.exists(temp_name):
             try:
@@ -315,8 +424,16 @@ def report_directory(kind=None):
         "PDF": os.path.join(report_root, "PDF Report"),
         "HTML": os.path.join(report_root, "HTML Report"),
     }
+    os.makedirs(report_root, mode=0o755, exist_ok=True)
     for folder_path in folders.values():
-        os.makedirs(folder_path, exist_ok=True)
+        os.makedirs(folder_path, mode=0o755, exist_ok=True)
+    # Keep the parent and report folders traversable/listable for non-root users
+    # even when the scanner was previously run with elevated privileges.
+    for folder_path in (report_root, *folders.values()):
+        try:
+            os.chmod(folder_path, 0o755)
+        except OSError:
+            pass
     folder_key = kind if kind in ("PDF", "HTML") else "TXT"
     return folders[folder_key]
 
@@ -431,14 +548,15 @@ def scan_menu(target):
     while True:
 
         print(f"\n{C_CYAN}{C_BRIGHT}Choose Scan Type{C_RESET}")
-        print(f"{C_GREEN}1. TCP Version OS Scan{C_RESET}")
-        print(f"{C_YELLOW}2. SYN Version OS Scan{C_RESET}")
-        print(f"{C_RED}3. Aggressive Scan{C_RESET}")
-        print(f"{C_MAGENTA}4. Manual Nmap Scan{C_RESET}")
-        print(f"{C_WHITE}5. Back{C_RESET}")
+        print_option("1. TCP Version OS Scan", C_GREEN)
+        print_option("2. SYN Version OS Scan", C_YELLOW)
+        print_option("3. Aggressive Scan", C_RED)
+        print_option("4. Manual Nmap Scan", C_MAGENTA)
+        print_option("5. Back", C_WHITE)
+        print_option("0. Exit EH Scanner", C_RED)
 
         if scan_completed:
-            print(f"{C_CYAN}6. Next Page{C_RESET}")
+            print_option("6. Next Page", C_CYAN)
 
         try:
             option = int(input("Select option: "))
@@ -704,7 +822,8 @@ def api_key_settings_menu():
         print("1. Add / Change VulnCheck API key")
         print("2. Verify VulnCheck API key")
         print("3. Remove VulnCheck API key")
-        print("4. Back")
+        print_option("4. Back", C_WHITE)
+        print_option("0. Exit EH Scanner", C_RED)
         print("Current status:", "Configured (hidden)" if configured else "Not configured")
         choice = input("Select option: ").strip()
         if choice == "1":
@@ -1123,16 +1242,20 @@ def show_exploits(target, exploitdb, metasploit, port_info):
 
     print("\n========= Select Exploit =========")
     if exploits:
-        print("1. Select an Exploit")
-        print("2. Continue Without Selecting Exploit")
-        print("3. Back")
+        print_option("1. Select an Exploit", C_GREEN)
+        print_option("2. Continue Without Selecting Exploit", C_YELLOW)
+        print_option("3. Back", C_CYAN)
     else:
-        print("1. Continue Without Selecting Exploit")
-        print("2. Back")
+        print_option("1. Continue Without Selecting Exploit", C_GREEN)
+        print_option("2. Back", C_CYAN)
+    print_option("0. Back / Exit EH Scanner", C_RED)
     try:
         menu_choice = int(input("Select option: "))
     except ValueError:
         print("Invalid Selection.")
+        return None
+
+    if menu_choice == 0:
         return None
 
     if exploits:
@@ -1144,17 +1267,21 @@ def show_exploits(target, exploitdb, metasploit, port_info):
             print("Invalid Selection.")
             return None
     else:
-        if menu_choice == 2:
+        if menu_choice == 0 or menu_choice == 2:
             return None
         if menu_choice != 1:
             print("Invalid Selection.")
             return None
         return continue_without_exploit(target, port_info, exploits)
 
+    selection_text = input("Select Exploit number (or type Back to return): ").strip()
+    if selection_text.lower() in ("back", "b", "0"):
+        print("Returning to the previous menu.")
+        return None
     try:
-        selection = int(input("Select Exploit number: "))
+        selection = int(selection_text)
     except ValueError:
-        print("Invalid Selection.")
+        print("Invalid Selection. Enter an exploit number or Back.")
         return None
     if selection < 1 or selection > len(exploits):
         print("Invalid Selection.")
@@ -1289,17 +1416,25 @@ def run_metasploit_handler(config):
         print("Type 'exit' to return to EH Scanner. Use only on authorized systems.\n")
         report_data["metasploit_status"] = "Metasploit launched; session logging pending."
 
-        # util-linux/Termux `script` captures interactive terminal input/output when available.
-        script_path = shutil.which("script") if not is_windows() else None
-        if script_path:
-            fd, transcript_path = tempfile.mkstemp(prefix="ehscanner_msf_", suffix=".log")
-            os.close(fd)
-            wrapped = [script_path, "-q", "-c", shlex.join(command), transcript_path]
-            result = subprocess.run(wrapped, check=False)
-            session["capture_status"] = "Capture attempted; verifying transcript file."
+        interactive_runner = globals().get("GUI_INTERACTIVE_RUNNER")
+        process = None
+        if interactive_runner is not None:
+            # The browser runner streams output live and forwards browser input to msfconsole.
+            result = interactive_runner(command)
+            session["output"] = clean_terminal_ansi(result.stdout or "")
+            session["capture_status"] = "Captured interactive input/output through the local Web GUI."
         else:
-            result = subprocess.run(command, check=False)
-            session["capture_status"] = "Unavailable: interactive terminal logging utility not found; output was not captured."
+            # Keep the CLI's existing terminal-based interaction unchanged.
+            script_path = shutil.which("script") if not is_windows() else None
+            if script_path:
+                fd, transcript_path = tempfile.mkstemp(prefix="ehscanner_msf_", suffix=".log")
+                os.close(fd)
+                wrapped = [script_path, "-q", "-c", shlex.join(command), transcript_path]
+                result = subprocess.run(wrapped, check=False)
+                session["capture_status"] = "Capture attempted; verifying transcript file."
+            else:
+                result = subprocess.run(command, check=False)
+                session["capture_status"] = "Unavailable: interactive terminal logging utility not found; output was not captured."
 
         if transcript_path and os.path.exists(transcript_path):
             try:
@@ -1332,6 +1467,8 @@ def run_metasploit_handler(config):
         session["capture_status"] = f"Unavailable due to error: {error}"
         return False
     finally:
+        if "process" in locals() and process is not None:
+            _unregister_gui_process(process)
         session["end_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         if rc_path and os.path.exists(rc_path):
             try: os.remove(rc_path)
@@ -1597,7 +1734,8 @@ def manual_script(config):
 
         print("\n1. Run Recommended Script")
         print("2. Enter Another NSE Script")
-        print("3. Back")
+        print_option("3. Back", C_CYAN)
+        print_option("0. Exit EH Scanner", C_RED)
 
         try:
             choice = int(input("\nSelect option: "))
@@ -1930,6 +2068,10 @@ def save_pdf_report():
             y -= 10
 
     pdf.save()
+    try:
+        os.chmod(filename, 0o644)
+    except OSError:
+        pass
 
     print(f"\nPDF report saved: {filename}")
 
@@ -1941,10 +2083,11 @@ def save_pdf_report():
 def report_menu():
     while True:
         print_title("========== Report ==========")
-        print("1. PDF")
-        print("2. HTML")
-        print("3. All")
-        print("4. Back")
+        print_option("1. PDF", C_GREEN)
+        print_option("2. HTML", C_CYAN)
+        print_option("3. All", C_YELLOW)
+        print_option("4. Back", C_WHITE)
+        print_option("0. Exit EH Scanner", C_RED)
 
         try:
             choice = int(input("\nSelect option: "))
@@ -1984,7 +2127,7 @@ def netcat_menu(config):
     print(f"Selected port  : {scanned_port or 'Not set'}")
     print("1. Connect to the selected target and port (client)")
     print("2. Listen on a local port (listener)")
-    print("3. Back")
+    print_option("3. Back", C_CYAN)
     choice = input("Select Netcat mode: ").strip()
     if choice == "3": return
     if choice == "1":
@@ -2036,15 +2179,21 @@ def netcat_menu(config):
             os.close(fd)
             wrapped = [script_path, "-q", "-c", shlex.join(command), transcript_path]
             process = subprocess.Popen(wrapped)
+            _register_gui_process(process)
             session["capture_status"] = "Capture attempted; verifying transcript file."
         else:
             # Keep the original interactive terminal flow; report honestly that output isn't captured.
             process = subprocess.Popen(command)
+            _register_gui_process(process)
             session["capture_status"] = "Unavailable: interactive terminal logging utility not found; output was not captured."
         print("\nNetcat is running with no automatic time limit.")
         print("Press Ctrl+C at any time to stop Netcat and return to EH Scanner.")
         try:
             return_code = process.wait()
+            stop_event = globals().get("GUI_STOP_EVENT")
+            if stop_event is not None and stop_event.is_set():
+                status = "Stopped by user (Web GUI Stop)"
+                raise GUIStopRequested()
             status = "Process exited normally" if return_code == 0 else f"Process exited with error (code {return_code})"
         except KeyboardInterrupt:
             status = "Stopped by user (Ctrl+C)"
@@ -2056,6 +2205,7 @@ def netcat_menu(config):
                     process.kill(); return_code = process.wait()
             else:
                 return_code = process.returncode
+            _confirm_exit()
     except KeyboardInterrupt:
         status = "Stopped by user (Ctrl+C)"
         print("\nNetcat interrupted; returning to EH Scanner.")
@@ -2064,6 +2214,7 @@ def netcat_menu(config):
             try: return_code = process.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 process.kill(); return_code = process.wait()
+        _confirm_exit()
     except OSError as exc:
         status = f"Could not start: {exc}"
         session["capture_status"] = f"Unavailable: {exc}"
@@ -2112,11 +2263,12 @@ def show_config(config, exploits, target, port_info):
             print(f"{key}: {value}")
 
         print("\n1. Auto Script Run")
-        print(f"{C_YELLOW}2. Manual Script{C_RESET}")
-        print(f"{C_RED}3. Start Metasploit{C_RESET}")
-        print(f"{C_CYAN}4. Report{C_RESET}")
-        print(f"{C_MAGENTA}5. Netcat{C_RESET}")
-        print(f"{C_WHITE}6. Back{C_RESET}")
+        print_option("2. Manual Script", C_YELLOW)
+        print_option("3. Start Metasploit", C_RED)
+        print_option("4. Report", C_CYAN)
+        print_option("5. Netcat", C_MAGENTA)
+        print_option("6. Back", C_WHITE)
+        print_option("0. Exit EH Scanner", C_RED)
 
         try:
             choice = int(input("\nSelect option: "))
@@ -2187,11 +2339,14 @@ def show_exploits_again(target, exploits, port_info):
         print(f"Recommendation: {recommendation}")
         print("===========================")
 
+    selection_text = input("\nSelect Exploit number (or type Back to return): ").strip()
+    if selection_text.lower() in ("back", "b", "0"):
+        print("Returning to the previous menu.")
+        return None
     try:
-        selection = int(input("\nSelect Exploit number: "))
-
+        selection = int(selection_text)
     except ValueError:
-        print("Invalid Selection.")
+        print("Invalid Selection. Enter an exploit number or Back.")
         return None
 
     if selection < 1 or selection > len(exploits):
@@ -2256,6 +2411,127 @@ def get_local_ip():
 
 
 # ============================================================
+# NETWORK INTERFACE / SUBNET DISCOVERY
+# ============================================================
+
+def get_local_networks():
+    """Return locally assigned IPv4 networks, preferring exact interface CIDRs.
+
+    Uses psutil when installed, then native OS commands. A /24 guess is only a
+    last-resort fallback and is clearly marked to the caller.
+    """
+    networks = []
+
+    try:
+        import psutil  # Optional dependency; no installation required.
+        for addresses in psutil.net_if_addrs().values():
+            for address in addresses:
+                if address.family != socket.AF_INET:
+                    continue
+                ip = address.address
+                mask = address.netmask
+                if not ip or ip.startswith("127.") or not mask:
+                    continue
+                try:
+                    network = ipaddress.ip_interface(f"{ip}/{mask}").network
+                except ValueError:
+                    continue
+                if network.num_addresses > 1 and network not in networks:
+                    networks.append(network)
+    except Exception:
+        pass
+
+    if not networks and is_windows() and command_exists("ipconfig"):
+        try:
+            result = subprocess.run(["ipconfig"], capture_output=True, text=True,
+                                    errors="replace", timeout=8)
+            current_ip = current_mask = None
+            for line in result.stdout.splitlines():
+                ip_match = re.search(r"IPv4[^:]*:\s*([0-9.]+)", line, re.I)
+                mask_match = re.search(r"Subnet Mask[^:]*:\s*([0-9.]+)", line, re.I)
+                if ip_match:
+                    current_ip = ip_match.group(1)
+                if mask_match:
+                    current_mask = mask_match.group(1)
+                    if current_ip and not current_ip.startswith("127."):
+                        try:
+                            network = ipaddress.ip_interface(f"{current_ip}/{current_mask}").network
+                            if network not in networks:
+                                networks.append(network)
+                        except ValueError:
+                            pass
+                    current_ip = current_mask = None
+        except Exception:
+            pass
+
+    if not networks and not is_windows() and command_exists("ip"):
+        try:
+            result = subprocess.run(["ip", "-o", "-4", "addr", "show"],
+                                    capture_output=True, text=True, errors="replace", timeout=8)
+            for line in result.stdout.splitlines():
+                match = re.search(r"\binet\s+(\d{1,3}(?:\.\d{1,3}){3}/\d{1,2})\b", line)
+                if match:
+                    try:
+                        interface = ipaddress.ip_interface(match.group(1))
+                        if not interface.ip.is_loopback and interface.network not in networks:
+                            networks.append(interface.network)
+                    except ValueError:
+                        pass
+        except Exception:
+            pass
+
+    if not networks:
+        local_ip = get_local_ip()
+        try:
+            address = ipaddress.ip_address(local_ip)
+            if address.version == 4 and not address.is_loopback:
+                networks.append(ipaddress.ip_network(f"{local_ip}/24", strict=False))
+        except ValueError:
+            pass
+
+    # Avoid scanning loopback and excessively large ranges accidentally.
+    return [network for network in networks if network.version == 4 and not network.is_loopback]
+
+
+def discover_local_hosts(network):
+    """Discover IPv4 hosts on a user-selected local subnet using available tools."""
+    started = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if command_exists("nmap"):
+        command = ["nmap", "-sn", "-n", str(network)]
+        stdout, stderr, return_code = run_with_animation(command)
+        discovered_ips = []
+        for line in stdout.splitlines():
+            match = re.search(r"Nmap scan report for (?:.*\()?((?:\d{1,3}\.){3}\d{1,3})\)?$", line.strip())
+            if match:
+                candidate = match.group(1)
+                try:
+                    ipaddress.IPv4Address(candidate)
+                    if candidate not in discovered_ips:
+                        discovered_ips.append(candidate)
+                except ValueError:
+                    pass
+        return command, started, stdout, stderr, return_code, discovered_ips
+
+    if not is_windows() and command_exists("netdiscover"):
+        command = ["netdiscover", "-P", "-r", str(network)]
+        stdout, stderr, return_code = run_with_animation(command)
+        discovered_ips = []
+        for line in stdout.splitlines():
+            match = re.match(r"^\s*((?:\d{1,3}\.){3}\d{1,3})\s+([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})\b", line)
+            if match:
+                candidate = match.group(1)
+                try:
+                    ipaddress.IPv4Address(candidate)
+                    if candidate not in discovered_ips:
+                        discovered_ips.append(candidate)
+                except ValueError:
+                    pass
+        return command, started, stdout, stderr, return_code, discovered_ips
+
+    return [], started, "", "No compatible discovery tool found. Install Nmap (recommended) or Netdiscover on a supported Linux/Unix system.", 127, []
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
@@ -2267,12 +2543,11 @@ def main():
 
     while True:
 
-        print("""
-1. Discover Network
-2. Select Target
-3. API Key Settings
-4. Exit
-""")
+        print_option("1. Discover Network", C_GREEN)
+        print_option("2. Select Target", C_CYAN)
+        print_option("3. API Key Settings", C_YELLOW)
+        print_option("4. Exit", C_WHITE)
+        print_option("0. Exit EH Scanner (with confirmation)", C_RED)
 
         try:
             option = int(input("Select option: "))
@@ -2282,58 +2557,54 @@ def main():
             continue
 
         if option == 1:
-            # Use Netdiscover for ARP-based local network discovery.
-            if not command_exists("netdiscover"):
-                print_error("Netdiscover was not found. Install Netdiscover and try again.")
+            networks = get_local_networks()
+            if not networks:
+                print_error("Could not determine a local IPv4 subnet. Connect to a network and try again.")
                 continue
 
-            local_ip = get_local_ip()
-            try:
-                network = ipaddress.ip_network(local_ip + "/24", strict=False)
-            except ValueError:
-                print_error("Could not determine the local network.")
-                continue
+            if len(networks) == 1:
+                network = networks[0]
+            else:
+                print_title("Available Local IPv4 Networks")
+                for index, candidate_network in enumerate(networks, start=1):
+                    print(f"{index}. {candidate_network}")
+                print("0. Back")
+                try:
+                    network_choice = int(input("Select network: "))
+                except ValueError:
+                    print_error("Invalid selection.")
+                    continue
+                if network_choice == 0:
+                    continue
+                if not 1 <= network_choice <= len(networks):
+                    print_error("Invalid selection.")
+                    continue
+                network = networks[network_choice - 1]
 
-            print(f"\nDiscovering hosts with Netdiscover on {network} ...")
-            command = ["netdiscover", "-P", "-r", str(network)]
-            started = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            stdout, stderr, return_code = run_with_animation(command)
+            print_warning("Only scan a local network you own or are authorized to assess.")
+            print(f"\nDiscovering hosts on {network} ...")
+            command, started, stdout, stderr, return_code, discovered_ips = discover_local_hosts(network)
 
             if stdout.strip():
-                print_title("Full Netdiscover Results")
+                print_title("Network Discovery Results")
                 print(stdout.rstrip())
             if stderr.strip():
-                print_warning("Netdiscover messages:")
+                print_warning("Discovery messages:")
                 print(stderr.rstrip())
 
             if return_code != 0:
-                print_error(f"Netdiscover failed with exit code {return_code}.")
+                print_error(f"Network discovery failed with exit code {return_code}.")
                 continue
 
-            # Netdiscover -P output is machine-friendly: IP and MAC columns first.
-            discovered_ips = []
-            for line in stdout.splitlines():
-                match = re.match(r"^\s*((?:\d{1,3}\.){3}\d{1,3})\s+([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})\b", line)
-                if not match:
-                    continue
-                candidate = match.group(1)
-                try:
-                    ipaddress.IPv4Address(candidate)
-                except ValueError:
-                    continue
-                if candidate not in discovered_ips:
-                    discovered_ips.append(candidate)
-
-            # Preserve the complete discovery output for the current report session.
             reset_report(None)
             report_data["network_discovery_result"] = (
-                f"Command: {' '.join(command)}\nStarted: {started}\n"
+                f"Command: {' '.join(command)}\nNetwork: {network}\nStarted: {started}\n"
                 f"Exit Code: {return_code}\n\n{stdout}"
                 + (f"\n[STDERR]\n{stderr}" if stderr.strip() else "")
             )
 
             if not discovered_ips:
-                print_warning("Netdiscover completed, but no selectable IPv4 hosts were found.")
+                print_warning("Discovery completed, but no selectable IPv4 hosts were found.")
                 continue
 
             print_title("Select a Discovered Host (IP Address Only)")
@@ -2377,4 +2648,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except ExitRequested:
+        try:
+            save_default_txt_report()
+        except Exception as report_error:
+            print_warning(f"Final report could not be saved: {report_error}")
+        print("\nEH Scanner exited cleanly. Goodbye.")
