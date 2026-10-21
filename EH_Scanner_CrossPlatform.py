@@ -28,14 +28,24 @@ def _register_gui_process(process):
     """Expose a live child process to the local Web GUI Stop button, when present."""
     processes = globals().get("GUI_ACTIVE_PROCESSES")
     if processes is not None:
-        processes.add(process)
+        lock = globals().get("GUI_ACTIVE_PROCESSES_LOCK")
+        if lock is not None:
+            with lock:
+                processes.add(process)
+        else:
+            processes.add(process)
 
 
 def _unregister_gui_process(process):
     """Remove a completed child process from the Web GUI's active-process set."""
     processes = globals().get("GUI_ACTIVE_PROCESSES")
     if processes is not None:
-        processes.discard(process)
+        lock = globals().get("GUI_ACTIVE_PROCESSES_LOCK")
+        if lock is not None:
+            with lock:
+                processes.discard(process)
+        else:
+            processes.discard(process)
 
 
 _original_input = builtins.input
@@ -233,8 +243,12 @@ def check_dependencies():
 
     required = ["nmap"]
     discovery_tools = [name for name in ("nmap", "netdiscover") if command_exists(name)]
-    print(f"{'discovery':<12}: {', '.join(discovery_tools) if discovery_tools else 'No discovery tool found'}")
-    print("              Network Discovery prefers Nmap; Netdiscover is a Linux/Unix fallback.")
+    if os.environ.get("EH_SCANNER_WEB_GUI") == "1":
+        # Keep the Web GUI checklist concise; CLI output remains unchanged.
+        print(f"Network Discovery: {'FOUND' if discovery_tools else 'NOT FOUND'}")
+    else:
+        print(f"{'discovery':<12}: {', '.join(discovery_tools) if discovery_tools else 'No discovery tool found'}")
+        print("              Network Discovery prefers Nmap; Netdiscover is a Linux/Unix fallback.")
 
     for command in required:
         status = "FOUND" if command_exists(command) else "NOT FOUND"
@@ -355,7 +369,7 @@ def run_with_animation(command):
         if stop_event is not None and stop_event.is_set():
             print("Returning to the EH Scanner main menu (Web GUI cancellation).")
             raise GUIStopRequested()
-        _confirm_exit()
+        # Ctrl+C while a child command runs cancels that command only.
         marker = "Stopped by user (GUI Stop/Ctrl+C)."
         stderr = ((stderr or "").rstrip() + "\n" + marker).strip()
         return stdout or "", stderr, 130
@@ -621,7 +635,14 @@ def scan_menu(target):
 
         report_data["scan_command"] = display_command
 
-        result_stdout, result_stderr, return_code = run_with_animation(command)
+        try:
+            result_stdout, result_stderr, return_code = run_with_animation(command)
+        except GUIStopRequested:
+            stop_event = globals().get("GUI_STOP_EVENT")
+            if stop_event is not None:
+                stop_event.clear()
+            print_warning("Task stopped. You are still in the current scan menu.")
+            continue
 
         scan_result = result_stdout
         report_data["scan_result"] = result_stdout
@@ -1841,6 +1862,26 @@ def manual_script(config):
 # REPORT TEXT
 # ============================================================
 
+def _web_gui_clean_metasploit_output(value):
+    """Remove common console noise while retaining useful results and errors."""
+    if not value:
+        return ""
+    noise = re.compile(
+        r"(?:^|\s)(?:status(?:ed)?\s+in(?:put)?|ioctl\s+for\s+devices|"
+        r"loading\s+.*(?:module|plugin|framework)|msf[0-9a-z]*\s*>\s*)",
+        re.IGNORECASE,
+    )
+    kept = []
+    for line in clean_terminal_ansi(str(value)).splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if noise.search(stripped):
+            continue
+        kept.append(line.rstrip())
+    return "\n".join(kept)
+
+
 def build_report_text():
 
     data = report_data
@@ -1938,7 +1979,10 @@ def build_report_text():
     report.append(f"End time: {msf_session.get('end_time')}")
     report.append(f"Exit code: {msf_session.get('exit_code', 'N/A')}")
     report.append("Captured terminal input/output:")
-    report.append(msf_session.get("output", "") or "No captured terminal transcript.")
+    msf_output = msf_session.get("output", "")
+    if os.environ.get("EH_SCANNER_WEB_GUI") == "1":
+        msf_output = _web_gui_clean_metasploit_output(msf_output)
+    report.append(msf_output or "No relevant terminal output captured.")
     report.append("")
 
     nc_session = data.get("netcat_session", {})
@@ -2193,8 +2237,10 @@ def netcat_menu(config):
             stop_event = globals().get("GUI_STOP_EVENT")
             if stop_event is not None and stop_event.is_set():
                 status = "Stopped by user (Web GUI Stop)"
-                raise GUIStopRequested()
-            status = "Process exited normally" if return_code == 0 else f"Process exited with error (code {return_code})"
+                stop_event.clear()
+                print_warning("Netcat task stopped. Returning to the current configuration menu.")
+            else:
+                status = "Process exited normally" if return_code == 0 else f"Process exited with error (code {return_code})"
         except KeyboardInterrupt:
             status = "Stopped by user (Ctrl+C)"
             print("\nNetcat stopped by user; returning to EH Scanner.")
@@ -2205,7 +2251,7 @@ def netcat_menu(config):
                     process.kill(); return_code = process.wait()
             else:
                 return_code = process.returncode
-            _confirm_exit()
+            # Ctrl+C cancelled the active Netcat session only.
     except KeyboardInterrupt:
         status = "Stopped by user (Ctrl+C)"
         print("\nNetcat interrupted; returning to EH Scanner.")
@@ -2214,7 +2260,7 @@ def netcat_menu(config):
             try: return_code = process.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 process.kill(); return_code = process.wait()
-        _confirm_exit()
+        # Ctrl+C cancelled the active Netcat session only.
     except OSError as exc:
         status = f"Could not start: {exc}"
         session["capture_status"] = f"Unavailable: {exc}"
@@ -2583,7 +2629,14 @@ def main():
 
             print_warning("Only scan a local network you own or are authorized to assess.")
             print(f"\nDiscovering hosts on {network} ...")
-            command, started, stdout, stderr, return_code, discovered_ips = discover_local_hosts(network)
+            try:
+                command, started, stdout, stderr, return_code, discovered_ips = discover_local_hosts(network)
+            except GUIStopRequested:
+                stop_event = globals().get("GUI_STOP_EVENT")
+                if stop_event is not None:
+                    stop_event.clear()
+                print_warning("Discovery task stopped. Returning to the discovery/main menu without resetting the session.")
+                continue
 
             if stdout.strip():
                 print_title("Network Discovery Results")
